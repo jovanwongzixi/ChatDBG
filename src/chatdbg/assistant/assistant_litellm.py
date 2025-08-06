@@ -10,7 +10,7 @@ import warnings
 with warnings.catch_warnings():
     warnings.simplefilter("ignore")
     import litellm
-from openai import OpenAI, OpenAIError
+import openai
 
 from ..util.trim import sandwich_tokens, trim_messages
 from ..util.text import strip_ansi
@@ -54,13 +54,12 @@ class Assistant:
         for f in functions:
             self._add_function(f)
 
-        self._model = MODEL # overwrite gpt-4o initialisation in config for now
-        self._openai_client = OpenAI(api_key=API_KEY, base_url=API_BASE)
+        self._model = model
         self._timeout = timeout
         self._conversation = [{"role": "system", "content": instructions}]
         self._max_call_response_tokens = max_call_response_tokens
 
-        # self._check_model()
+        self._check_model()
         self._broadcast("on_begin_dialog", instructions)
 
     def close(self):
@@ -101,7 +100,7 @@ class Assistant:
             stats["model"] = self._model
             stats["completed"] = True
             stats["message"] = f"\n[Cost: ~${stats['cost']:.2f} USD]"
-        except OpenAIError as e:
+        except openai.OpenAIError as e:
             self._warn_about_exception(e, f"Unexpected OpenAI Error.  Retry the query.")
             stats["message"] = f"[Exception: {e}]"
         except KeyboardInterrupt:
@@ -127,57 +126,45 @@ class Assistant:
                 method(*args)
 
     def _check_model(self):
-        # result = litellm.validate_environment(self._model)
-        # missing_keys = result["missing_keys"]
-        # if missing_keys != []:
-        #     _, provider, _, _ = litellm.get_llm_provider(self._model)
-        #     if provider == "openai":
-        #         raise AssistantError(
-        #             textwrap.dedent(
-        #                 f"""\
-        #             You need an OpenAI key to use the {self._model} model.
-        #             You can get a key here: https://platform.openai.com/api-keys.
-        #             Set the environment variable OPENAI_API_KEY to your key value."""
-        #             )
-        #         )
-        #     else:
-        #         raise AssistantError(
-        #             textwrap.dedent(
-        #                 f"""\
-        #             You need to set the following environment variables
-        #             to use the {self._model} model: {', '.join(missing_keys)}."""
-        #             )
-        #         )
+        result = litellm.validate_environment(self._model)
+        missing_keys = result["missing_keys"]
+        if missing_keys != []:
+            _, provider, _, _ = litellm.get_llm_provider(self._model)
+            if provider == "openai":
+                raise AssistantError(
+                    textwrap.dedent(
+                        f"""\
+                    You need an OpenAI key to use the {self._model} model.
+                    You can get a key here: https://platform.openai.com/api-keys.
+                    Set the environment variable OPENAI_API_KEY to your key value."""
+                    )
+                )
+            else:
+                raise AssistantError(
+                    textwrap.dedent(
+                        f"""\
+                    You need to set the following environment variables
+                    to use the {self._model} model: {', '.join(missing_keys)}."""
+                    )
+                )
 
-        # try:
-        #     if not litellm.supports_function_calling(self._model):
-        #         raise AssistantError(
-        #             textwrap.dedent(
-        #                 f"""\
-        #             The {self._model} model does not support function calls.
-        #             You must use a model that does, eg. gpt-4."""
-        #             )
-        #         )
-        # except:
-        #     raise AssistantError(
-        #         textwrap.dedent(
-        #             f"""\
-        #         {self._model} does not appear to be a supported model.
-        #         See https://docs.litellm.ai/docs/providers."""
-        #         )
-        #     )
         try:
-            result = self._openai_client.models.retrieve(self._model)
-            print(result)
-        except OpenAIError:
+            if not litellm.supports_function_calling(self._model):
+                raise AssistantError(
+                    textwrap.dedent(
+                        f"""\
+                    The {self._model} model does not support function calls.
+                    You must use a model that does, eg. gpt-4."""
+                    )
+                )
+        except:
             raise AssistantError(
                 textwrap.dedent(
                     f"""\
-                {self._model} does not appear to be a supported model. {result}
-                """
+                {self._model} does not appear to be a supported model.
+                See https://docs.litellm.ai/docs/providers."""
                 )
             )
-
 
     def _add_function(self, function):
         """
@@ -231,14 +218,11 @@ class Assistant:
                         tool_chunks.append(chunk)
             finally:
                 self._broadcast("on_end_stream")
-            
-            # print(f"Chunks: {chunks}")
-            # print(f"messages: {self._conversation}")
+
             # then compute for the part that litellm gives back.
             completion = litellm.stream_chunk_builder(
                 chunks, messages=self._conversation
             )
-            # raise Exception("test")
             cost += litellm.completion_cost(completion)
 
             # add content to conversation, but if there is no content, then the message
@@ -290,8 +274,10 @@ class Assistant:
 
         self._trim_conversation()
 
-        return self._openai_client.chat.completions.create(
+        return litellm.completion(
             model=self._model,
+            api_key = API_KEY,
+            api_base = API_BASE,
             messages=self._conversation,
             tools=[
                 {"type": "function", "function": f["schema"]}
