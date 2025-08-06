@@ -1,4 +1,5 @@
 import json
+import collections
 import string
 import textwrap
 import time
@@ -27,7 +28,52 @@ class AssistantError(Exception):
     def __init__(self, *args: object) -> None:
         super().__init__(*args)
 
+def _merge_chunks(chunks):
+    # Check for a final usage chunk, and merge it with the last chunk.
+    if not chunks[-1].choices and chunks[-1].usage:
+        chunks[-2].usage = chunks[-1].usage
+        chunks.pop()
 
+    assert all(len(chunk.choices) == 1 for chunk in chunks)
+
+    finish_reason = chunks[-1].choices[0].finish_reason
+    usage = chunks[-1].usage
+    content = "".join(
+        chunk.choices[0].delta.content
+        for chunk in chunks
+        if chunk.choices[0].delta.content  # It can be None for tool calls.
+    )
+
+    tool_chunks = [
+        bit
+        for chunk in chunks
+        if chunk.choices[0].delta.tool_calls
+        for bit in chunk.choices[0].delta.tool_calls
+    ]
+    tool_calls = collections.defaultdict(
+        lambda: {"id": "", "name": "", "arguments": ""}
+    )
+    for tool_chunk in tool_chunks:
+        if tool_chunk.id:
+            tool_calls[tool_chunk.index]["id"] += tool_chunk.id
+        if tool_chunk.function.name:
+            tool_calls[tool_chunk.index]["name"] += tool_chunk.function.name
+        if tool_chunk.function.arguments:
+            tool_calls[tool_chunk.index]["arguments"] += tool_chunk.function.arguments
+
+    tool_calls = [
+        {
+            "id": tool_call["id"],
+            "function": {
+                "name": tool_call["name"],
+                "arguments": tool_call["arguments"],
+            },
+            "type": "function",
+        }
+        for tool_call in tool_calls.values()
+    ]
+
+    return finish_reason, content, tool_calls, usage
 def remove_non_printable_chars(s: str) -> str:
     printable_chars = set(string.printable)
     filtered_string = "".join(filter(lambda x: x in printable_chars, s))
@@ -89,33 +135,33 @@ class Assistant:
             - "prompt_tokens":      our prompts
             - "completion_tokens":  the LLM completions part
         """
-        stats = {"completed": False, "cost": 0}
+        results = {"completed": False, "cost": 0}
         start = time.time()
 
         self._broadcast("on_begin_query", prompt, user_text)
         try:
-            stats = self._streamed_query(prompt, user_text)
+            results = self._streamed_query(prompt, user_text)
             elapsed = time.time() - start
 
-            stats["time"] = elapsed
-            stats["model"] = self._model
-            stats["completed"] = True
-            stats["message"] = f"\n[Cost: ~${stats['cost']:.2f} USD]"
+            results["time"] = elapsed
+            results["model"] = self._model
+            results["completed"] = True
+            results["message"] = f"\n[Cost: ~${results['cost']:.2f} USD]"
         except OpenAIError as e:
             self._warn_about_exception(e, f"Unexpected OpenAI Error.  Retry the query.")
-            stats["message"] = f"[Exception: {e}]"
+            results["message"] = f"[Exception: {e}]"
         except KeyboardInterrupt:
             # user action -- just ignore
-            stats["message"] = "[Chat Interrupted]"
+            results["message"] = "[Chat Interrupted]"
         except Exception as e:
             self._warn_about_exception(e, f"Unexpected Exception.")
-            stats["message"] = f"[Exception: {e}]"
+            results["message"] = f"[Exception: {e}]"
 
-        self._broadcast("on_end_query", stats)
-        return stats
+        self._broadcast("on_end_query", results)
+        return results
 
-    def _report(self, stats):
-        if stats["completed"]:
+    def _report(self, results):
+        if results["completed"]:
             print()
         else:
             print("[Chat Interrupted]")
@@ -189,9 +235,9 @@ class Assistant:
         self._functions[schema["name"]] = {"function": function, "schema": schema}
 
     def _make_call(self, tool_call) -> str:
-        name = tool_call.function.name
+        name = tool_call["function"]["name"]
         try:
-            args = json.loads(tool_call.function.arguments)
+            args = json.loads(tool_call["function"]["arguments"])
             function = self._functions[name]
             call, result = function["function"](**args)
             result = remove_non_printable_chars(strip_ansi(result).expandtabs())
@@ -208,8 +254,9 @@ class Assistant:
         cost = 0
 
         self._conversation.append({"role": "user", "content": prompt})
+        usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
-        while True:
+        while True: # break only when finish_reason == "stop"
             stream = self._stream_completion()
 
             # litellm.stream_chunk_builder is broken for new GPT models
@@ -220,71 +267,86 @@ class Assistant:
             try:
                 self._broadcast("on_begin_stream")
                 chunks = []
-                tool_chunks = []
+                # tool_chunks = []
                 for chunk in stream:
                     chunks.append(chunk)
-                    if chunk.choices[0].delta.content != None:
-                        self._broadcast(
-                            "on_stream_delta", chunk.choices[0].delta.content
-                        )
-                    else:
-                        tool_chunks.append(chunk)
+                    if chunk.choices:
+                        assert len(chunk.choices) == 1
+                        if chunk.choices[0].delta.content != None:
+                            self._broadcast(
+                                "on_stream_delta", chunk.choices[0].delta.content
+                            )
+                        # else:
+                        #     tool_chunks.append(chunk)
             finally:
                 self._broadcast("on_end_stream")
             
             # print(f"Chunks: {chunks}")
             # print(f"messages: {self._conversation}")
             # then compute for the part that litellm gives back.
-            completion = litellm.stream_chunk_builder(
-                chunks, messages=self._conversation
-            )
-            # raise Exception("test")
-            cost += litellm.completion_cost(completion)
+            # completion = litellm.stream_chunk_builder(
+            #     chunks, messages=self._conversation
+            # )
+            # # raise Exception("test")
+            # cost += litellm.completion_cost(completion)
 
-            # add content to conversation, but if there is no content, then the message
-            # has only tool calls, and skip this step
-            response_message = completion.choices[0].message
-            if response_message.content != None:
-                # fix: remove tool calls.  They get added below.
-                response_message = response_message.copy()
-                response_message["tool_calls"] = None
-                self._conversation.append(response_message.json())
+            # # add content to conversation, but if there is no content, then the message
+            # # has only tool calls, and skip this step
+            # response_message = completion.choices[0].message
+            # if response_message.content != None:
+            #     # fix: remove tool calls.  They get added below.
+            #     response_message = response_message.copy()
+            #     response_message["tool_calls"] = None
+            #     self._conversation.append(response_message.json())
 
-            if response_message.content != None:
-                self._broadcast("on_response", response_message.content)
+            # if response_message.content != None:
+            #     self._broadcast("on_response", response_message.content)
 
-            if completion.choices[0].finish_reason == "tool_calls":
-                # create a message with just the tool calls, append that to the conversation, and generate the responses.
-                tool_completion = litellm.stream_chunk_builder(
-                    tool_chunks, self._conversation
+            # if completion.choices[0].finish_reason == "tool_calls":
+            #     # create a message with just the tool calls, append that to the conversation, and generate the responses.
+            #     tool_completion = litellm.stream_chunk_builder(
+            #         tool_chunks, self._conversation
+            #     )
+
+            #     # this part wasn't counted above...
+            #     cost += litellm.completion_cost(tool_completion)
+            finish_reason, content, tool_calls, usage_delta = _merge_chunks(chunks)
+            usage["prompt_tokens"] += usage_delta.prompt_tokens
+            usage["completion_tokens"] += usage_delta.completion_tokens
+            usage["total_tokens"] += usage_delta.total_tokens
+            if content:
+                self._conversation.append({"role": "assistant", "content": content})
+                self._broadcast("on_response", content)
+            if finish_reason == "tool_calls":
+                self._conversation.append(
+                    {"role": "assistant", "tool_calls": tool_calls}
                 )
+                self._add_function_results_to_conversation(tool_calls)
+            if finish_reason == "stop":
+                break
+                # tool_message = tool_completion.choices[0].message
 
-                # this part wasn't counted above...
-                cost += litellm.completion_cost(tool_completion)
-
-                tool_message = tool_completion.choices[0].message
-
-                tool_json = tool_message.json()
+                # tool_json = tool_message.json()
 
                 # patch for litellm sometimes putting index fields in the tool calls it constructs
                 # in stream_chunk_builder.  gpt-4-turbo-2024-04-09 can't handle those index fields, so
                 # just remove them for the moment.
-                for tool_call in tool_json.get("tool_calls", []):
-                    _ = tool_call.pop("index", None)
+            #     for tool_call in tool_json.get("tool_calls", []):
+            #         _ = tool_call.pop("index", None)
 
-                tool_json["role"] = "assistant"
-                self._conversation.append(tool_json)
-                self._add_function_results_to_conversation(tool_message)
-            else:
-                break
+            #     tool_json["role"] = "assistant"
+            #     self._conversation.append(tool_json)
+            #     self._add_function_results_to_conversation(tool_message)
+            # else:
+                # break
 
-        stats = {
-            "cost": cost,
-            "tokens": completion.usage.total_tokens,
-            "prompt_tokens": completion.usage.prompt_tokens,
-            "completion_tokens": completion.usage.completion_tokens,
-        }
-        return stats
+        # results = {
+        #     "cost": cost,
+        #     "tokens": completion.usage.total_tokens,
+        #     "prompt_tokens": completion.usage.prompt_tokens,
+        #     "completion_tokens": completion.usage.completion_tokens,
+        # }
+        return usage
 
     def _stream_completion(self):
 
@@ -299,6 +361,7 @@ class Assistant:
             ],
             timeout=self._timeout,
             stream=True,
+            stream_options={"include_usage": True},
         )
 
     def _trim_conversation(self):
@@ -312,9 +375,9 @@ class Assistant:
                 "on_warn", f"Trimming conversation from {old_len} to {new_len} tokens."
             )
 
-    def _add_function_results_to_conversation(self, response_message):
-        response_message["role"] = "assistant"
-        tool_calls = response_message.tool_calls
+    def _add_function_results_to_conversation(self, tool_calls):
+        # response_message["role"] = "assistant"
+        # tool_calls = response_message["tool"]
         try:
             for tool_call in tool_calls:
                 function_response = self._make_call(tool_call)
@@ -322,9 +385,9 @@ class Assistant:
                     function_response, self._model, self._max_call_response_tokens, 0.5
                 )
                 response = {
-                    "tool_call_id": tool_call.id,
+                    "tool_call_id": tool_call["id"],
                     "role": "tool",
-                    "name": tool_call.function.name,
+                    "name": tool_call["function"]["name"],
                     "content": function_response,
                 }
                 self._conversation.append(response)
