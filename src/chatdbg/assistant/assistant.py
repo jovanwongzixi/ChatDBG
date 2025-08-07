@@ -135,33 +135,45 @@ class Assistant:
             - "prompt_tokens":      our prompts
             - "completion_tokens":  the LLM completions part
         """
-        results = {"completed": False, "cost": 0}
+        result = {"completed": False, "cost": 0}
         start = time.time()
 
         self._broadcast("on_begin_query", prompt, user_text)
         try:
-            results = self._streamed_query(prompt, user_text)
+            self._streamed_query(prompt, user_text)
             elapsed = time.time() - start
 
-            results["time"] = elapsed
-            results["model"] = self._model
-            results["completed"] = True
-            results["message"] = f"\n[Cost: ~${results['cost']:.2f} USD]"
-        except OpenAIError as e:
-            self._warn_about_exception(e, f"Unexpected OpenAI Error.  Retry the query.")
-            results["message"] = f"[Exception: {e}]"
+        #     results["time"] = elapsed
+        #     results["model"] = self._model
+        #     results["completed"] = True
+        #     results["message"] = f"\n[Cost: ~${results['cost']:.2f} USD]"
+        # except OpenAIError as e:
+        #     self._warn_about_exception(e, f"Unexpected OpenAI Error.  Retry the query.")
+        #     results["message"] = f"[Exception: {e}]"
+            # litellm model data not used for us
+            # if self._model in litellm.model_data:
+            #     model_data = litellm.model_data[self._model]
+            #     result["cost"] = (
+            #         stats["prompt_tokens"] * model_data["input_cost_per_token"]
+            #         + stats["completion_tokens"] * model_data["output_cost_per_token"]
+            #     )
+            #     result["message"] = f"\n[Cost: ~${result['cost']:.2f} USD]"
+
+            result["time"] = elapsed
+            result["model"] = self._model
+            result["completed"] = True
         except KeyboardInterrupt:
             # user action -- just ignore
-            results["message"] = "[Chat Interrupted]"
+            result["message"] = "[Chat Interrupted]"
         except Exception as e:
             self._warn_about_exception(e, f"Unexpected Exception.")
-            results["message"] = f"[Exception: {e}]"
+            result["message"] = f"[Exception: {e}]"
 
-        self._broadcast("on_end_query", results)
-        return results
+        self._broadcast("on_end_query", result)
+        return result
 
-    def _report(self, results):
-        if results["completed"]:
+    def _report(self, stats):
+        if stats["completed"]:
             print()
         else:
             print("[Chat Interrupted]")
@@ -269,6 +281,7 @@ class Assistant:
                 chunks = []
                 # tool_chunks = []
                 for chunk in stream:
+                    # print(chunk)
                     chunks.append(chunk)
                     if chunk.choices:
                         assert len(chunk.choices) == 1
@@ -280,6 +293,8 @@ class Assistant:
                         #     tool_chunks.append(chunk)
             finally:
                 self._broadcast("on_end_stream")
+                print(chunks[-1])
+                
             
             # print(f"Chunks: {chunks}")
             # print(f"messages: {self._conversation}")
@@ -311,19 +326,22 @@ class Assistant:
             #     # this part wasn't counted above...
             #     cost += litellm.completion_cost(tool_completion)
             finish_reason, content, tool_calls, usage_delta = _merge_chunks(chunks)
-            usage["prompt_tokens"] += usage_delta.prompt_tokens
-            usage["completion_tokens"] += usage_delta.completion_tokens
-            usage["total_tokens"] += usage_delta.total_tokens
+            # usage["prompt_tokens"] += usage_delta.prompt_tokens
+            # usage["completion_tokens"] += usage_delta.completion_tokens
+            # usage["total_tokens"] += usage_delta.total_tokens
             if content:
                 self._conversation.append({"role": "assistant", "content": content})
                 self._broadcast("on_response", content)
+                continue
             if finish_reason == "tool_calls":
                 self._conversation.append(
                     {"role": "assistant", "tool_calls": tool_calls}
                 )
                 self._add_function_results_to_conversation(tool_calls)
-            if finish_reason == "stop":
-                break
+                continue
+            # if finish_reason == "stop":
+            #     break
+            break
                 # tool_message = tool_completion.choices[0].message
 
                 # tool_json = tool_message.json()
@@ -346,12 +364,12 @@ class Assistant:
         #     "prompt_tokens": completion.usage.prompt_tokens,
         #     "completion_tokens": completion.usage.completion_tokens,
         # }
-        return usage
+        # return usage
 
     def _stream_completion(self):
 
         self._trim_conversation()
-
+        # print(self._functions.values())
         return self._openai_client.chat.completions.create(
             model=self._model,
             messages=self._conversation,
@@ -361,7 +379,7 @@ class Assistant:
             ],
             timeout=self._timeout,
             stream=True,
-            stream_options={"include_usage": True},
+            # stream_options={"include_usage": True},
         )
 
     def _trim_conversation(self):
